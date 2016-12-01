@@ -90,17 +90,26 @@ inline void InitCentroids(dmlc::RowBlockIter<unsigned> *data,
                           Matrix *centroids) {
   data->BeforeFirst();
   CHECK(data->Next()) << "dataset is empty";
+  // RowBlockIter的value为RowBlock
   const RowBlock<unsigned> &block = data->Value();
   int num_cluster = centroids->nrow;
+  // 循环i in num_cluster次（聚类簇个数）
   for (int i = 0; i < num_cluster; ++i) {
-    int index = Random(block.size);
-    Row<unsigned> v = block[index];
-    for (unsigned j = 0; j < v.length; ++j) {
-      (*centroids)[i][v.index[j]] = v.get_value(j);
+    //  block.size为数据的个数。
+    int index = Random(block.size); // 随机一个数据点
+    Row<unsigned> v = block[index]; // v是这个数据点的value向量。
+    for (unsigned j = 0; j < v.length; ++j) { // j是value中的一个下标。
+      // https://github.com/dmlc/dmlc-core/blob/master/src/data/row_block.h
+      // https://github.com/dmlc/dmlc-core/blob/master/include/dmlc/data.h Row的定义
+      // v.index[j]是什么？v的第j个index，返回一个IndexType
+      // 补充：v.index[j]返回的是特征所对应的index。因为libsvm的格式，是稀疏向量。
+      // 将随机的数据点v的值赋给第i个聚类中心。一个聚类中心其实就是一个数据点。
+      (*centroids)[i][v.index[j]] = v.get_value(j); 
     }
   }
   for (int i = 0; i < num_cluster; ++i) {
     int proc = Random(rabit::GetWorldSize());
+    // 注意这里的broadcast，将随机某个进程proc的第i个聚类中心broadcast到其他节点。
     rabit::Broadcast((*centroids)[i], centroids->ncol * sizeof(float), proc);
   }
 }
@@ -146,25 +155,29 @@ int main(int argc, char *argv[]) {
   // intialize rabit engine
   rabit::Init(argc, argv);
   
+  //读数据：使用RowBlockIter，参数为数据文件地址，当前节点，总节点数，格式。
   RowBlockIter<index_t> *data
       = RowBlockIter<index_t>::Create
       (argv[1],
        rabit::GetRank(),
        rabit::GetWorldSize(),
        "libsvm");
-  // load model
-  Model model; 
+  // load model，模型主要为一个matrix。
+  Model model;  
+  // 获取当前迭代次数
   int iter = rabit::LoadCheckPoint(&model);
   if (iter == 0) {
-    size_t fdim = data->NumCol();
+    // 若为0则初始化，
+    size_t fdim = data->NumCol(); // 列数，即特征数
     rabit::Allreduce<op::Max>(&fdim, 1);
-    model.InitModel(num_cluster, fdim);
-    InitCentroids(data, &model.centroids);
+    model.InitModel(num_cluster, fdim); // 初始化matrix 
+    InitCentroids(data, &model.centroids); // 随机初始化聚类中心
     model.Normalize();
   }
-  const unsigned num_feat = static_cast<unsigned>(model.centroids.ncol);
-
+  const unsigned num_feat = static_cast<unsigned>(model.centroids.ncol); // 列数为特征数
+  
   // matrix to store the result
+  // 存储了每个数据点
   Matrix temp;
   for (int r = iter; r < max_iter; ++r) {
     temp.Init(num_cluster, num_feat + 1, 0.0f);
@@ -172,28 +185,31 @@ int main(int argc, char *argv[]) {
     {
       // lambda function used to calculate the data if necessary
       // this function may not be called when the result can be directly recovered
+      // 不大懂这个语法。。。
       data->BeforeFirst();
+      // 每个节点都取全部的数据？？  RowBlockIter的 BeforeFirst()，Next()，Value()。
       while (data->Next()) {
-        const auto &batch = data->Value();
+        const auto &batch = data->Value(); // 多个data，很可能是按batch_size切分。
         for (size_t i = 0; i < batch.size; ++i) {
           auto v = batch[i];
-          size_t k = GetCluster(model.centroids, v);
+          size_t k = GetCluster(model.centroids, v); // 找到某个data的所属的聚类簇
           // temp[k] += v
           for (size_t j = 0; j < v.length; ++j) {
-            temp[k][v.index[j]] += v.get_value(j);
+            temp[k][v.index[j]] += v.get_value(j); // 让temp的第k个聚类簇的数据加上v。
           }
           // use last column to record counts
           temp[k][num_feat] += 1.0f;
         }
       }
     };
+    // 全局更新结果矩阵
     rabit::Allreduce<op::Sum>(&temp.data[0], temp.data.size(), lazy_get_centroid);
     // set number
     for (int k = 0; k < num_cluster; ++k) {
       float cnt = temp[k][num_feat];
       if (cnt != 0.0f) {        
         for (unsigned i = 0; i < num_feat; ++i) {
-          model.centroids[k][i] = temp[k][i] / cnt;
+          model.centroids[k][i] = temp[k][i] / cnt; // 利用SUM/cnt取AVG，更新第k个聚类中心。
         }
       } else {
         rabit::TrackerPrintf("Error: found zero size cluster, maybe too less number of datapoints?\n");
